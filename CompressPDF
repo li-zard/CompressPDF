@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# PDF Compressor to a target file size (for Thunar)
+# Modes:
+#   Normal     — GS /printer → /ebook → rasterization fallback
+#   Precise    — GS only with gradual DPI reduction (best for small reductions ~5-40%)
+#   Aggressive — rasterization with low quality and scale (for high-res scans)
+
+input_pdf="$1"
+if [[ -z "$input_pdf" || ! -f "$input_pdf" ]]; then
+    zenity --error --text="Please select a PDF file!"
+    exit 1
+fi
+if ! command -v zenity &> /dev/null; then
+    echo "zenity not found" >&2; exit 1
+fi
+
+# === DIALOG: target size ===
+target_mb=$(zenity --entry \
+    --title="Compress PDF" \
+    --text="Maximum output file size (MB):" \
+    --entry-text="2.0")
+[[ -z "$target_mb" ]] && exit 1
+
+# === DIALOG: mode selection ===
+mode=$(zenity --list \
+    --title="Compression Mode" \
+    --text="Select compression mode:" \
+    --radiolist \
+    --column="" --column="Mode" --column="When to use" \
+    TRUE  "Normal"     "Universal: GS presets, then rasterization" \
+    FALSE "Precise"    "Small reduction 5-40%, best quality" \
+    FALSE "Aggressive" "High-resolution scans, lower quality" \
+    2>/dev/null)
+[[ -z "$mode" ]] && exit 1
+
+target_bytes=$(awk -v mb="$target_mb" 'BEGIN{printf "%d", mb * 1048576}')
+
+# === Check if file already fits ===
+input_size=$(stat -c %s "$input_pdf")
+if (( input_size <= target_bytes )); then
+    zenity --info --text="✅ File already within limit!\nSize: $(du -h "$input_pdf" | cut -f1)"
+    exit 0
+fi
+
+# === Check dependencies ===
+for cmd in pdftoppm pdfinfo ffmpeg python3 gs; do
+    if ! command -v "$cmd" &>/dev/null; then
+        zenity --error --text="Required tool not found: $cmd"
+        exit 1
+    fi
+done
+if ! python3 -c "import img2pdf" 2>/dev/null; then
+    zenity --error --text="Python module img2pdf not found.\nInstall with: pip install img2pdf"
+    exit 1
+fi
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+output="${input_pdf%.pdf}_compressed.pdf"
+
+# img2pdf wrapper with pixel limit removed (needed for high-res scans)
+cat > "$tmp/img2pdf_safe.py" << 'PYEOF'
+import sys, PIL.Image
+PIL.Image.MAX_IMAGE_PIXELS = None
+import img2pdf
+with open(sys.argv[1], "wb") as f:
+    f.write(img2pdf.convert(sys.argv[2:]))
+PYEOF
+
+num_pages=$(pdfinfo "$input_pdf" 2>/dev/null | grep -i '^Pages:' | awk '{print $2}')
+(( num_pages < 1 )) && num_pages=1
+input_mb=$(awk -v s="$input_size" 'BEGIN{printf "%.1f", s/1048576}')
+zenity --notification --text="File: ${input_mb} MB | Limit: ${target_mb} MB | Pages: ${num_pages} | Mode: ${mode}"
+
+# ============================================================
+# Ghostscript with a named preset (/printer, /ebook, etc.)
+# Returns output path on success, nothing on failure.
+# ============================================================
+try_gs_preset() {
+    local preset="$1" outf="$2"
+    gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.5 \
+       -dPDFSETTINGS="/$preset" \
+       -dNOPAUSE -dQUIET -dBATCH \
+       -sOutputFile="$outf" "$input_pdf" 2>/dev/null
+    [[ -f "$outf" && -s "$outf" ]] || return 1
+    local sz sz_mb
+    sz=$(stat -c %s "$outf")
+    sz_mb=$(awk -v s="$sz" 'BEGIN{printf "%.2f", s/1048576}')
+    if (( sz <= target_bytes )); then
+        echo "$outf"; return 0
+    fi
+    zenity --notification --text="GS /${preset}: ${sz_mb} MB — did not fit"
+    return 1
+}
+
+# ============================================================
+# Ghostscript with explicit DPI and high JPEG quality (92).
+# Used in Precise mode for fine-grained control.
+# Returns output path on success, nothing on failure.
+# ============================================================
+try_gs_dpi() {
+    local dpi="$1" outf="$2"
+    gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.5 \
+       -dNOPAUSE -dQUIET -dBATCH \
+       -dDownsampleColorImages=true \
+       -dDownsampleGrayImages=true \
+       -dColorImageDownsampleType=/Bicubic \
+       -dGrayImageDownsampleType=/Bicubic \
+       -dColorImageResolution="$dpi" \
+       -dGrayImageResolution="$dpi" \
+       -dColorImageDownsampleThreshold=1.0 \
+       -dGrayImageDownsampleThreshold=1.0 \
+       -dAutoFilterColorImages=false \
+       -dAutoFilterGrayImages=false \
+       -dColorImageFilter=/DCTEncode \
+       -dGrayImageFilter=/DCTEncode \
+       -dJPEGQ=92 \
+       -sOutputFile="$outf" "$input_pdf" 2>/dev/null
+    [[ -f "$outf" && -s "$outf" ]] || return 1
+    local sz sz_mb
+    sz=$(stat -c %s "$outf")
+    sz_mb=$(awk -v s="$sz" 'BEGIN{printf "%.2f", s/1048576}')
+    if (( sz <= target_bytes )); then
+        echo "$outf"; return 0
+    fi
+    zenity --notification --text="GS DPI=${dpi}: ${sz_mb} MB — did not fit"
+    return 1
+}
+
+# ============================================================
+# Rasterize PDF with pdftoppm, resize+recompress with ffmpeg,
+# then reassemble into PDF with img2pdf.
+# Args: dpi quality scale passdir
+# Returns output path on success, nothing on failure.
+# ============================================================
+compress_raster() {
+    local dpi="$1" quality="$2" scale="$3" passdir="$4"
+    mkdir -p "$passdir"
+
+    pdftoppm -jpeg -r "$dpi" "$input_pdf" "$passdir/page" 2>/dev/null
+    mapfile -t raw_files < <(ls -v "$passdir"/page*.jpg 2>/dev/null)
+    if (( ${#raw_files[@]} == 0 )); then
+        zenity --error --text="pdftoppm produced no files (DPI=${dpi})"
+        return 1
+    fi
+
+    # Convert quality percentage to ffmpeg -q:v scale (1=best, 31=worst)
+    local ffmpeg_q
+    ffmpeg_q=$(awk -v q="$quality" 'BEGIN{v=int((100-q)/3.2+1); if(v<1)v=1; if(v>31)v=31; print v}')
+
+    local processed=()
+    for f in "${raw_files[@]}"; do
+        [[ -f "$f" ]] || continue
+        local out="${f%.jpg}_out.jpg"
+
+        if (( $(awk -v s="$scale" 'BEGIN{print (s < 0.995)}') )); then
+            # Scale width explicitly; let ffmpeg derive height (-2 = keep aspect ratio, round to even)
+            local w
+            read -r w < <(ffprobe -v error -select_streams v:0 \
+                -show_entries stream=width \
+                -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null)
+            if [[ -n "$w" && "$w" -gt 0 ]] 2>/dev/null; then
+                local nw
+                nw=$(awk -v w="$w" -v s="$scale" 'BEGIN{printf "%d", int(w*s/2)*2}')
+                ffmpeg -y -i "$f" -vf "scale=${nw}:-2:flags=lanczos" \
+                    -q:v "$ffmpeg_q" "$out" 2>/dev/null
+            else
+                ffmpeg -y -i "$f" -q:v "$ffmpeg_q" "$out" 2>/dev/null
+            fi
+        else
+            # No resize needed — recompress only
+            ffmpeg -y -i "$f" -q:v "$ffmpeg_q" "$out" 2>/dev/null
+        fi
+
+        if [[ -f "$out" && -s "$out" ]]; then processed+=("$out")
+        else processed+=("$f"); fi  # fallback: use original if ffmpeg failed
+    done
+
+    (( ${#processed[@]} == 0 )) && return 1
+
+    zenity --notification --text="Building PDF from ${#processed[@]} pages..."
+    python3 "$tmp/img2pdf_safe.py" "$passdir/result.pdf" "${processed[@]}" 2>/tmp/img2pdf_err.txt
+    if [[ $? -ne 0 || ! -s "$passdir/result.pdf" ]]; then
+        zenity --error --text="img2pdf error:\n$(head -3 /tmp/img2pdf_err.txt 2>/dev/null)"
+        return 1
+    fi
+    echo "$passdir/result.pdf"
+}
+
+# ============================================================
+# MODE: PRECISE
+# GS only — no rasterization. Tries /printer first, then steps
+# through explicit DPI values. Falls back to /ebook as last resort.
+# ============================================================
+if [[ "$mode" == "Precise" ]]; then
+    zenity --notification --text="Precise mode: trying GS /printer..."
+    result=$(try_gs_preset "printer" "$tmp/gs_printer.pdf")
+    if [[ -n "$result" ]]; then
+        mv "$result" "$output"
+        zenity --info --text="✅ Done (GS /printer)!\nSize: $(du -h "$output" | cut -f1)"
+        exit 0
+    fi
+
+    zenity --notification --text="Precise mode: stepping DPI 280 → 100..."
+    for dpi in 280 250 220 200 180 160 150 130 120 100; do
+        result=$(try_gs_dpi "$dpi" "$tmp/gs_dpi${dpi}.pdf")
+        if [[ -n "$result" ]]; then
+            mv "$result" "$output"
+            zenity --info --text="✅ Done (GS DPI=${dpi})!\nSize: $(du -h "$output" | cut -f1)"
+            exit 0
+        fi
+    done
+
+    zenity --notification --text="Precise mode: last resort — GS /ebook..."
+    result=$(try_gs_preset "ebook" "$tmp/gs_ebook_last.pdf")
+    if [[ -n "$result" ]]; then
+        mv "$result" "$output"
+        zenity --info --text="✅ Done (GS /ebook)!\nSize: $(du -h "$output" | cut -f1)"
+        exit 0
+    fi
+
+    zenity --error --text="Precise mode could not reach the target size.\nTry Normal or Aggressive mode."
+    exit 1
+fi
+
+# ============================================================
+# MODE: NORMAL
+# Try GS presets first; fall through to rasterization if needed.
+# ============================================================
+if [[ "$mode" == "Normal" ]]; then
+    result=$(try_gs_preset "printer" "$tmp/gs_printer.pdf")
+    if [[ -n "$result" ]]; then
+        mv "$result" "$output"
+        zenity --info --text="✅ Done (GS /printer)!\nSize: $(du -h "$output" | cut -f1)"
+        exit 0
+    fi
+    result=$(try_gs_preset "ebook" "$tmp/gs_ebook.pdf")
+    if [[ -n "$result" ]]; then
+        mv "$result" "$output"
+        zenity --info --text="✅ Done (GS /ebook)!\nSize: $(du -h "$output" | cut -f1)"
+        exit 0
+    fi
+    # GS presets not enough — fall through to rasterization
+    quality_start=82
+    quality_min=65
+    scale_min=0.35
+    jpeg_factor=0.18
+fi
+
+# ============================================================
+# MODE: AGGRESSIVE
+# Skip GS presets entirely — go straight to rasterization
+# with lower quality settings.
+# ============================================================
+if [[ "$mode" == "Aggressive" ]]; then
+    quality_start=65
+    quality_min=40
+    scale_min=0.20
+    jpeg_factor=0.12
+fi
+
+# ============================================================
+# Rasterization path (Normal fallback and Aggressive)
+#
+# Strategy: rasterize one page at 72 DPI to measure real page
+# dimensions, estimate source DPI from file size, then calculate
+# a starting scale that should land close to the target in one pass.
+# ============================================================
+zenity --notification --text="Rasterization: measuring page at 72 DPI..."
+
+pdftoppm -jpeg -r 72 -f 1 -l 1 "$input_pdf" "$tmp/probe" 2>/dev/null
+probe_file=$(ls -v "$tmp"/probe*.jpg 2>/dev/null | head -1)
+if [[ -z "$probe_file" || ! -s "$probe_file" ]]; then
+    zenity --error --text="Could not rasterize page for measurement"
+    exit 1
+fi
+
+read -r probe_w probe_h < <(ffprobe -v error -select_streams v:0 \
+    -show_entries stream=width,height \
+    -of default=noprint_wrappers=1:nokey=1 "$probe_file" 2>/dev/null)
+# Fallback to A4 at 72 DPI if ffprobe fails
+[[ -z "$probe_w" || "$probe_w" -le 0 ]] 2>/dev/null && probe_w=595
+[[ -z "$probe_h" || "$probe_h" -le 0 ]] 2>/dev/null && probe_h=842
+
+# Estimate source DPI from bytes-per-page vs pixels at 72 DPI
+# Assumes ~0.25 bytes/pixel for typical JPEG compression
+bytes_per_page=$(( input_size / num_pages ))
+page_pixels_72=$(( probe_w * probe_h ))
+real_scale=$(awk -v bp="$bytes_per_page" -v pp="$page_pixels_72" \
+    'BEGIN{
+        if (pp <= 0) { print 1.0; exit }
+        s = sqrt(bp / (pp * 0.25))
+        if (s < 0.5) s = 0.5
+        if (s > 8.0) s = 8.0
+        printf "%.2f", s
+    }')
+real_dpi=$(awk -v s="$real_scale" 'BEGIN{printf "%d", 72 * s}')
+
+# Cap raster DPI at 300 and floor at 72
+raster_dpi=300
+(( real_dpi < raster_dpi )) && raster_dpi=$real_dpi
+(( raster_dpi < 72 )) && raster_dpi=72
+
+raster_w=$(awk -v pw="$probe_w" -v rdpi="$raster_dpi" 'BEGIN{printf "%d", pw / 72 * rdpi}')
+raster_h=$(awk -v ph="$probe_h" -v rdpi="$raster_dpi" 'BEGIN{printf "%d", ph / 72 * rdpi}')
+zenity --notification --text="Rasterizing at ${raster_dpi} DPI → ~${raster_w}×${raster_h}px per page"
+
+# Calculate starting scale:
+# Model: JPEG_size ≈ width × height × scale² × jpeg_factor
+# Solve for scale: scale = sqrt(target / (w × h × pages × factor × overhead))
+start_scale=$(awk -v tb="$target_bytes" \
+                  -v rw="$raster_w" -v rh="$raster_h" \
+                  -v np="$num_pages" -v jf="$jpeg_factor" \
+                  -v sm="$scale_min" \
+    'BEGIN{
+        total = rw * rh * np
+        if (total <= 0) { print 1.0; exit }
+        s = sqrt(tb / (total * jf * 1.05))
+        if (s > 0.97) s = 1.0   # avoid trivial resize when almost no reduction needed
+        if (s > 1.0)  s = 1.0
+        if (s < sm)   s = sm
+        printf "%.3f", s
+    }')
+
+zenity --notification --text="Starting parameters: Q=${quality_start} scale=${start_scale}"
+
+quality=$quality_start
+scale=$start_scale
+attempt=0
+max_attempts=12
+last_result=""
+sz_mb="?"
+
+while (( attempt < max_attempts )); do
+    ((attempt++))
+    passdir="$tmp/pass_${attempt}"
+    zenity --notification --text="Attempt ${attempt}/${max_attempts}: dpi=${raster_dpi} Q=${quality} scale=${scale}"
+
+    result=$(compress_raster "$raster_dpi" "$quality" "$scale" "$passdir")
+    [[ -z "$result" ]] && exit 1
+    last_result="$result"
+
+    sz=$(stat -c %s "$result")
+    sz_mb=$(awk -v s="$sz" 'BEGIN{printf "%.2f", s/1048576}')
+
+    if (( sz <= target_bytes )); then
+        mv "$result" "$output"
+        zenity --info --text="✅ Done!\nSize: ${sz_mb} MB\n(Q=${quality} scale=${scale} dpi=${raster_dpi})"
+        exit 0
+    fi
+
+    zenity --notification --text="Attempt ${attempt}: ${sz_mb} MB > limit ${target_mb} MB"
+
+    # Adaptive scale recalculation based on actual result:
+    # new_scale = old_scale × sqrt(target / actual) × 0.92 safety margin
+    new_scale=$(awk -v s="$scale" -v sz="$sz" -v t="$target_bytes" -v m="$scale_min" \
+        'BEGIN{
+            if (sz <= 0) { printf "%.3f", s * 0.80; exit }
+            ns = s * sqrt(t / sz) * 0.92
+            if (ns >= s) ns = s * 0.80   # force reduction if formula stalled
+            if (ns > 1.0) ns = 1.0
+            if (ns < m) ns = m
+            printf "%.3f", ns
+        }')
+    quality=$(( quality - 4 ))
+    (( quality < quality_min )) && quality=$quality_min
+    scale=$new_scale
+
+    at_min_q=$(( quality <= quality_min ))
+    at_min_s=$(awk -v s="$scale" -v m="$scale_min" 'BEGIN{print (s <= m+0.005)}')
+    if (( at_min_q && at_min_s )); then break; fi
+done
+
+zenity --error --text="Could not reach target size of ${target_mb} MB.\nBest result: ${sz_mb} MB\nSaved as _big.pdf"
+[[ -n "$last_result" ]] && mv "$last_result" "${output%.pdf}_big.pdf" 2>/dev/null
+exit 1
